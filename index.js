@@ -150,6 +150,124 @@ app.post('/api/render', async (req, res) => {
   }
 });
 
+// Video render endpoint — injects staggered CSS animations and captures as video
+app.post('/api/render-video', async (req, res) => {
+  try {
+    const { html, css, google_fonts, viewport_width, viewport_height, duration } = req.body;
+
+    if (!html) {
+      return res.status(400).json({ error: 'html field is required' });
+    }
+
+    const width = viewport_width || 1080;
+    const height = viewport_height || 1080;
+    const animDuration = duration || 4000;
+
+    // Staggered reveal animations — injected server-side so Build HTML stays clean
+    const animationCss = `
+      @keyframes fadeUp {
+        from { opacity: 0; transform: translateY(28px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+      @keyframes ctaPulse {
+        0% { opacity: 0; transform: scale(0.9); }
+        60% { opacity: 1; transform: scale(1.03); }
+        100% { opacity: 1; transform: scale(1); }
+      }
+      /* Tag / category — first to appear */
+      .tag, .lga, .lga-hero, .category { opacity: 0; animation: fadeUp 0.5s ease both; animation-delay: 0.3s; }
+      /* Headline */
+      .h, .header, .stat { opacity: 0; animation: fadeUp 0.6s ease both; animation-delay: 0.7s; }
+      /* Accent / highlight line */
+      .hi, .stat-label { opacity: 0; animation: fadeUp 0.5s ease both; animation-delay: 1.1s; }
+      /* Body text */
+      .bt, .subheader, .body { opacity: 0; animation: fadeUp 0.5s ease both; animation-delay: 1.5s; }
+      /* Checklist items — stagger each one */
+      .checklist li { opacity: 0; animation: fadeUp 0.4s ease both; }
+      .checklist li:nth-child(1) { animation-delay: 0.8s; }
+      .checklist li:nth-child(2) { animation-delay: 1.0s; }
+      .checklist li:nth-child(3) { animation-delay: 1.2s; }
+      .checklist li:nth-child(4) { animation-delay: 1.4s; }
+      .checklist li:nth-child(5) { animation-delay: 1.6s; }
+      /* CTA button — last, with a subtle scale pop */
+      .btn, .cta { opacity: 0; animation: ctaPulse 0.5s ease both; animation-delay: 2.0s; }
+      /* Decorative elements fade in early and gently */
+      .holes, .fold, .frame-inner { opacity: 0; animation: fadeIn 0.8s ease both; animation-delay: 0.1s; }
+    `;
+
+    // Build Google Fonts link
+    let fontsLink = '';
+    if (google_fonts) {
+      const families = google_fonts.split('|').map(f => {
+        const [name, weights] = f.split(':');
+        const encoded = name.trim().replace(/\s+/g, '+');
+        if (weights) {
+          return `family=${encoded}:wght@${weights.split(',').join(';')}`;
+        }
+        return `family=${encoded}`;
+      }).join('&');
+      fontsLink = `<link href="https://fonts.googleapis.com/css2?${families}&display=swap" rel="stylesheet">`;
+    }
+
+    // Build full HTML with animation CSS injected
+    const allCss = animationCss + (css || '');
+    let fullHtml;
+    if (html.trim().startsWith('<!DOCTYPE') || html.trim().startsWith('<html')) {
+      fullHtml = html;
+      if (fontsLink) fullHtml = fullHtml.replace('<head>', `<head>${fontsLink}`);
+      fullHtml = fullHtml.replace('</head>', `<style>${allCss}</style></head>`);
+    } else {
+      fullHtml = `<!DOCTYPE html><html><head><meta charset="utf-8">${fontsLink}<style>${allCss}</style></head><body>${html}</body></html>`;
+    }
+
+    const result = await enqueue(async () => {
+      const b = await getBrowser();
+      const context = await b.newContext({
+        viewport: { width, height },
+        recordVideo: { dir: RENDERS_DIR, size: { width, height } }
+      });
+      const page = await context.newPage();
+      await page.setContent(fullHtml, { waitUntil: 'networkidle' });
+      await page.evaluate(() => document.fonts.ready);
+      // Wait for all animations to complete + a brief hold at the end
+      await page.waitForTimeout(animDuration);
+      // Close page + context to finalize the video
+      await page.close();
+      const videoPath = await page.video().path();
+      await context.close();
+      return videoPath;
+    });
+
+    const id = uuidv4();
+    const filename = `${id}.webm`;
+    const dest = path.join(RENDERS_DIR, filename);
+    fs.renameSync(result, dest);
+
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    const hostedUrl = `${protocol}://${host}/api/renders/${filename}`;
+
+    res.json({
+      hosted_url: hostedUrl,
+      format: 'webm',
+      duration_ms: animDuration
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      error: 'Video render failed',
+      details: err.message
+    });
+  }
+});
+
+// Serve rendered files (png + webm)
+app.use('/api/renders', express.static(RENDERS_DIR));
+
 // Docs page
 app.get('/', (req, res) => {
   res.json({
@@ -157,7 +275,8 @@ app.get('/', (req, res) => {
     endpoints: {
       'GET /api/healthz': 'Health check',
       'POST /api/render': 'Render HTML to PNG',
-      'GET /api/renders/:id.png': 'Serve rendered images'
+      'POST /api/render-video': 'Render HTML animation to WebM video',
+      'GET /api/renders/:id': 'Serve rendered files'
     }
   });
 });

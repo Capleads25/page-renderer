@@ -265,7 +265,77 @@ app.post('/api/render-video', async (req, res) => {
   }
 });
 
-// Serve rendered files (png + webm)
+// PDF render endpoint
+app.post('/api/render-pdf', async (req, res) => {
+  try {
+    const { html, css, google_fonts, page_format, margin } = req.body;
+
+    if (!html) {
+      return res.status(400).json({ error: 'html field is required' });
+    }
+
+    const format = page_format || 'A4';
+    const pdfMargin = margin || {
+      top: '15mm', bottom: '15mm', left: '15mm', right: '15mm'
+    };
+
+    let fontsLink = '';
+    if (google_fonts) {
+      const families = google_fonts.split('|').map(f => {
+        const [name, weights] = f.split(':');
+        const encoded = name.trim().replace(/\s+/g, '+');
+        if (weights) return `family=${encoded}:wght@${weights.split(',').join(';')}`;
+        return `family=${encoded}`;
+      }).join('&');
+      fontsLink = `<link href="https://fonts.googleapis.com/css2?${families}&display=swap" rel="stylesheet">`;
+    }
+
+    let fullHtml;
+    if (html.trim().startsWith('<!DOCTYPE') || html.trim().startsWith('<html')) {
+      fullHtml = html;
+      if (fontsLink) fullHtml = fullHtml.replace('<head>', `<head>${fontsLink}`);
+      if (css) fullHtml = fullHtml.replace('</head>', `<style>${css}</style></head>`);
+    } else {
+      fullHtml = `<!DOCTYPE html><html><head><meta charset="utf-8">${fontsLink}${css ? `<style>${css}</style>` : ''}</head><body>${html}</body></html>`;
+    }
+
+    const result = await enqueue(async () => {
+      const b = await getBrowser();
+      const page = await b.newPage();
+      await page.setContent(fullHtml, { waitUntil: 'networkidle' });
+      await page.evaluate(() => document.fonts.ready);
+      await page.waitForTimeout(500);
+      const pdfBuffer = await page.pdf({
+        format,
+        margin: pdfMargin,
+        printBackground: true
+      });
+      await page.close();
+      return pdfBuffer;
+    });
+
+    const id = uuidv4();
+    const filename = `${id}.pdf`;
+    fs.writeFileSync(path.join(RENDERS_DIR, filename), result);
+
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    const hostedUrl = `${protocol}://${host}/api/renders/${filename}`;
+
+    res.json({
+      hosted_url: hostedUrl,
+      format: 'pdf'
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      error: 'PDF render failed',
+      details: err.message
+    });
+  }
+});
+
+// Serve rendered files (png + webm + pdf)
 app.use('/api/renders', express.static(RENDERS_DIR));
 
 // Docs page
@@ -276,6 +346,7 @@ app.get('/', (req, res) => {
       'GET /api/healthz': 'Health check',
       'POST /api/render': 'Render HTML to PNG',
       'POST /api/render-video': 'Render HTML animation to WebM video',
+      'POST /api/render-pdf': 'Render HTML to PDF (A4 default)',
       'GET /api/renders/:id': 'Serve rendered files'
     }
   });

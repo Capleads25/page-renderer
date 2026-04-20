@@ -367,14 +367,14 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
         await page.waitForFunction(() => {
           const html = document.body ? document.body.innerText : '';
           return /Library ID:?\s*\d/.test(html) || /No ads match/i.test(html) || /\d+\s+results?/i.test(html);
-        }, { timeout: 12000 });
+        }, { timeout: 7000 });
       } catch (e) {
-        // Fallback — no signal detected, give React a little more time
-        await page.waitForTimeout(4000);
+        // Fallback — no signal detected, short extra wait
+        await page.waitForTimeout(1500);
       }
 
-      // Small extra settle for any lazy-rendered ads
-      await page.waitForTimeout(1500);
+      // Small settle for any lazy-rendered ads
+      await page.waitForTimeout(800);
 
       const content = await page.content();
       await page.close();

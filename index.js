@@ -335,6 +335,74 @@ app.post('/api/render-pdf', async (req, res) => {
   }
 });
 
+// Scrape Meta Ad Library for a company name — returns ad count + URL.
+// Uses Playwright so FB's JS-rendered ad cards actually load (plain HTTP returns an empty shell).
+app.post('/api/scrape-meta-ads', async (req, res) => {
+  try {
+    const { company_name, country } = req.body;
+    if (!company_name) return res.status(400).json({ error: 'company_name required' });
+
+    const c = (country || 'AU').toUpperCase();
+    const q = encodeURIComponent(company_name);
+    const url = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${c}&q=${q}`;
+
+    const result = await enqueue(async () => {
+      const b = await getBrowser();
+      const page = await b.newPage();
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'en-AU,en;q=0.9'
+      });
+
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      } catch (e) {
+        await page.close();
+        throw new Error('Navigation failed: ' + e.message);
+      }
+
+      // Give React ~4s to render ad cards
+      await page.waitForTimeout(4000);
+
+      const content = await page.content();
+      await page.close();
+
+      // Signal: explicit "no ads" messaging
+      const noAds = /No ads match/i.test(content) ||
+                    /no results/i.test(content) ||
+                    /0 results/i.test(content);
+
+      // Count Library IDs — one per active ad group
+      const libIds = content.match(/Library ID:?\s*\d{6,}/gi) || [];
+      const uniqueIds = Array.from(new Set(libIds.map(s => s.replace(/\D+/g, ''))));
+
+      // Also try to read the "N results" count if present
+      let resultsCount = 0;
+      const rc = content.match(/(\d{1,5})\s+results?/i);
+      if (rc) resultsCount = parseInt(rc[1], 10) || 0;
+
+      return {
+        noAds,
+        adCount: uniqueIds.length,
+        resultsCount,
+        htmlLength: content.length
+      };
+    });
+
+    const isRunningAds = !result.noAds && (result.adCount > 0 || result.resultsCount > 0);
+
+    res.json({
+      isRunningAds,
+      adCount: Math.max(result.adCount, result.resultsCount),
+      adLibraryUrl: url,
+      debug: { htmlLength: result.htmlLength, noAds: result.noAds, libIds: result.adCount, resultsCount: result.resultsCount }
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Scrape failed', details: err.message });
+  }
+});
+
 // Serve rendered files (png + webm + pdf)
 app.use('/api/renders', express.static(RENDERS_DIR));
 
@@ -347,6 +415,7 @@ app.get('/', (req, res) => {
       'POST /api/render': 'Render HTML to PNG',
       'POST /api/render-video': 'Render HTML animation to WebM video',
       'POST /api/render-pdf': 'Render HTML to PDF (A4 default)',
+      'POST /api/scrape-meta-ads': 'Scrape Meta Ad Library via Playwright (body: company_name, country=AU)',
       'GET /api/renders/:id': 'Serve rendered files'
     }
   });

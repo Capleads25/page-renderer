@@ -361,8 +361,20 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
         throw new Error('Navigation failed: ' + e.message);
       }
 
-      // Give React ~4s to render ad cards
-      await page.waitForTimeout(4000);
+      // Wait for EITHER the ad cards OR an explicit "no ads" message, whichever first.
+      // Falls back to a fixed wait if neither selector resolves in time.
+      try {
+        await page.waitForFunction(() => {
+          const html = document.body ? document.body.innerText : '';
+          return /Library ID:?\s*\d/.test(html) || /No ads match/i.test(html) || /\d+\s+results?/i.test(html);
+        }, { timeout: 12000 });
+      } catch (e) {
+        // Fallback — no signal detected, give React a little more time
+        await page.waitForTimeout(4000);
+      }
+
+      // Small extra settle for any lazy-rendered ads
+      await page.waitForTimeout(1500);
 
       const content = await page.content();
       await page.close();

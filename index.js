@@ -339,7 +339,7 @@ app.post('/api/render-pdf', async (req, res) => {
 // Uses Playwright so FB's JS-rendered ad cards actually load (plain HTTP returns an empty shell).
 app.post('/api/scrape-meta-ads', async (req, res) => {
   try {
-    const { company_name, country } = req.body;
+    const { company_name, country, capture_screenshots } = req.body;
     if (!company_name) return res.status(400).json({ error: 'company_name required' });
 
     const c = (country || 'AU').toUpperCase();
@@ -377,7 +377,6 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
       await page.waitForTimeout(800);
 
       const content = await page.content();
-      await page.close();
 
       // Signal: explicit "no ads" messaging
       const noAds = /No ads match/i.test(content) ||
@@ -393,11 +392,69 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
       const rc = content.match(/(\d{1,5})\s+results?/i);
       if (rc) resultsCount = parseInt(rc[1], 10) || 0;
 
+      // Optionally capture screenshots of the first 3 ad cards.
+      // Fragile by nature (FB obfuscates class names) — fails gracefully.
+      let screenshotFilenames = [];
+      if (capture_screenshots && uniqueIds.length > 0) {
+        try {
+          // Walk up from each "Library ID" text node to the first
+          // reasonably-sized ancestor (the ad card wrapper).
+          const cardHandles = await page.evaluateHandle(() => {
+            const results = [];
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let node;
+            const seen = new Set();
+            while ((node = walker.nextNode()) && results.length < 5) {
+              if (/Library ID/i.test(node.nodeValue || '')) {
+                let el = node.parentElement;
+                while (el && el.parentElement) {
+                  const r = el.getBoundingClientRect();
+                  if (r.height >= 320 && r.height <= 1200 && r.width >= 260 && r.width <= 520) {
+                    if (!seen.has(el)) {
+                      seen.add(el);
+                      results.push(el);
+                    }
+                    break;
+                  }
+                  el = el.parentElement;
+                }
+              }
+            }
+            return results;
+          });
+          const props = await cardHandles.getProperties();
+          const elements = [];
+          for (const prop of props.values()) {
+            const el = prop.asElement();
+            if (el) elements.push(el);
+          }
+          const maxShots = Math.min(3, elements.length);
+          for (let i = 0; i < maxShots; i++) {
+            try {
+              const id = uuidv4();
+              const filename = `ad-${id}.png`;
+              const filepath = path.join(RENDERS_DIR, filename);
+              await elements[i].scrollIntoViewIfNeeded();
+              await page.waitForTimeout(300);
+              await elements[i].screenshot({ path: filepath, timeout: 5000 });
+              screenshotFilenames.push(filename);
+            } catch (shotErr) {
+              // Individual screenshot failed — keep going with the rest
+            }
+          }
+        } catch (capErr) {
+          // Whole capture failed — return empty array, main scrape still succeeds
+        }
+      }
+
+      await page.close();
+
       return {
         noAds,
         adCount: uniqueIds.length,
         resultsCount,
-        htmlLength: content.length
+        htmlLength: content.length,
+        screenshotFilenames
       };
     });
 
@@ -408,11 +465,19 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
     const hasResultsCount = result.resultsCount > 0;
     const isRunningAds = hasSolidLibIds || (!result.noAds && hasResultsCount);
 
+    // Build public URLs for any captured screenshots
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    const adScreenshots = (result.screenshotFilenames || []).map(
+      fn => `${protocol}://${host}/api/renders/${fn}`
+    );
+
     res.json({
       isRunningAds,
       adCount: Math.max(result.adCount, result.resultsCount),
       adLibraryUrl: url,
-      debug: { htmlLength: result.htmlLength, noAds: result.noAds, libIds: result.adCount, resultsCount: result.resultsCount }
+      adScreenshots,
+      debug: { htmlLength: result.htmlLength, noAds: result.noAds, libIds: result.adCount, resultsCount: result.resultsCount, screenshotsCaptured: (result.screenshotFilenames || []).length }
     });
 
   } catch (err) {

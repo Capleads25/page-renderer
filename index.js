@@ -420,6 +420,40 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
   }
 });
 
+// Proxy MillionVerifier email verification. n8n Cloud's egress IPs
+// are flagged by MV as "Free account abuse" — proxying through Railway
+// works around the IP reputation block.
+app.post('/api/verify-email', async (req, res) => {
+  try {
+    const { api_key, email } = req.body;
+    if (!api_key) return res.status(400).json({ error: 'api_key required' });
+    if (!email)   return res.status(400).json({ error: 'email required' });
+
+    const url = `https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(api_key)}&email=${encodeURIComponent(email)}&timeout=10`;
+
+    const mvResp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept':     'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+      }
+    });
+
+    const text = await mvResp.text();
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch (e) {
+      return res.status(502).json({ error: 'Non-JSON response from MV', status: mvResp.status, body: text.substring(0, 300) });
+    }
+
+    res.json(body);
+
+  } catch (err) {
+    res.status(500).json({ error: 'Proxy failed', details: err.message });
+  }
+});
+
 // Serve rendered files (png + webm + pdf)
 app.use('/api/renders', express.static(RENDERS_DIR));
 
@@ -433,6 +467,7 @@ app.get('/', (req, res) => {
       'POST /api/render-video': 'Render HTML animation to WebM video',
       'POST /api/render-pdf': 'Render HTML to PDF (A4 default)',
       'POST /api/scrape-meta-ads': 'Scrape Meta Ad Library via Playwright (body: company_name, country=AU)',
+      'POST /api/verify-email': 'Proxy MillionVerifier v3 (body: api_key, email) — works around IP reputation blocks',
       'GET /api/renders/:id': 'Serve rendered files'
     }
   });

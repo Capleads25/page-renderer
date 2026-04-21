@@ -401,7 +401,12 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
       };
     });
 
-    const isRunningAds = !result.noAds && (result.adCount > 0 || result.resultsCount > 0);
+    // Trust Library IDs over stray "No ads match" text — that message often
+    // appears in sidebar filter states on pages that DO have main-result ads.
+    // Require at least 3 unique Library IDs to filter out single-mention noise.
+    const hasSolidLibIds = result.adCount >= 3;
+    const hasResultsCount = result.resultsCount > 0;
+    const isRunningAds = hasSolidLibIds || (!result.noAds && hasResultsCount);
 
     res.json({
       isRunningAds,

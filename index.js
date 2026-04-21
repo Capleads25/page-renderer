@@ -10,9 +10,9 @@ app.use(express.json({ limit: '10mb' }));
 const RENDERS_DIR = path.join(__dirname, 'renders');
 if (!fs.existsSync(RENDERS_DIR)) fs.mkdirSync(RENDERS_DIR);
 
-// Concurrency queue — max 3 simultaneous renders
+// Concurrency queue — max 5 simultaneous renders
 let activeRenders = 0;
-const MAX_CONCURRENT = 3;
+const MAX_CONCURRENT = 5;
 const queue = [];
 
 function enqueue(fn) {

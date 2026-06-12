@@ -10,6 +10,66 @@ app.use(express.json({ limit: '10mb' }));
 const RENDERS_DIR = path.join(__dirname, 'renders');
 if (!fs.existsSync(RENDERS_DIR)) fs.mkdirSync(RENDERS_DIR);
 
+// --- Advertiser matching (only used when scrape-meta-ads is called with
+// match_name). A keyword search on the Ad Library returns ads from ANY company
+// containing those words, so we read each ad's real advertiser and keep only the
+// ones that genuinely belong to the searched business. Leaves the default
+// (no match_name) behaviour untouched for existing callers. ---
+const AD_GENERIC = new Set(['roofing','roofers','roofer','roof','maintenance','services','service','building','builders','build','property','guttering','gutter','ltd','limited','co','company','and','the','solutions','contractors','contractor','specialist','specialists','group','uk','repairs','repair','leadwork','flat','pitched','works','llp','driveways','driveway','resin','landscaping','landscapes','landscape','gardens','garden','kitchens','kitchen','bathrooms','bathroom','painters','painting','decorating','decorators','plastering']);
+const AD_LOC = new Set(['cumbria','cumbrian','lakeland','lakes','kendal','windermere','bowness','ambleside','keswick','penrith','carlisle','ulverston','barrow','workington','whitehaven','cockermouth','grange','kirkby','lonsdale','south','north','west','east','local']);
+
+function adTokens(name) {
+  return (name || '').toLowerCase().replace(/&/g, ' ').replace(/[^a-z0-9 ]/g, ' ')
+    .split(/\s+/).filter(Boolean);
+}
+function adStrongTokens(ts) {
+  return ts.filter((t) => !AD_GENERIC.has(t) && !AD_LOC.has(t));
+}
+// True only when every identifying word of the business appears in the
+// advertiser name AND the advertiser adds no other identifying word. This
+// rejects shared-word collisions (e.g. "Cumberland Roofing" vs "Cumberland News").
+function advertiserMatches(business, advertiser) {
+  const b = adStrongTokens(adTokens(business));
+  const a = adStrongTokens(adTokens(advertiser));
+  if (!b.length || !a.length) return false;
+  const aset = new Set(a), bset = new Set(b);
+  const bAllInA = b.every((t) => aset.has(t));
+  const aExtraStrong = a.filter((t) => !bset.has(t));
+  return bAllInA && aExtraStrong.length === 0;
+}
+
+// Reads the advertiser name from every ad card currently in the DOM.
+function extractAdvertisersInPage() {
+  const out = [];
+  const seen = new Set();
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (/Library ID/i.test(node.nodeValue || '')) {
+      let el = node.parentElement, card = null;
+      while (el && el.parentElement) {
+        const r = el.getBoundingClientRect();
+        if (r.height >= 260 && r.height <= 1400 && r.width >= 240 && r.width <= 600) { card = el; break; }
+        el = el.parentElement;
+      }
+      if (card) {
+        const link = Array.from(card.querySelectorAll('a')).find(
+          (x) => /facebook\.com\/(\d+|[A-Za-z0-9.\-]+)\/?$/.test(x.getAttribute('href') || '') && (x.innerText || '').trim(),
+        );
+        const libId = (node.nodeValue.match(/\d{6,}/) || [''])[0];
+        if (link && libId && !seen.has(libId)) {
+          seen.add(libId);
+          out.push({
+            advertiser: (link.innerText || '').trim().split('\n')[0],
+            pageId: (link.getAttribute('href').match(/facebook\.com\/(\d+)/) || [])[1] || null,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 // Concurrency queue — max 5 simultaneous renders
 let activeRenders = 0;
 const MAX_CONCURRENT = 5;
@@ -339,7 +399,7 @@ app.post('/api/render-pdf', async (req, res) => {
 // Uses Playwright so FB's JS-rendered ad cards actually load (plain HTTP returns an empty shell).
 app.post('/api/scrape-meta-ads', async (req, res) => {
   try {
-    const { company_name, country, capture_screenshots } = req.body;
+    const { company_name, country, capture_screenshots, match_name } = req.body;
     if (!company_name) return res.status(400).json({ error: 'company_name required' });
 
     const c = (country || 'AU').toUpperCase();
@@ -391,6 +451,21 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
       let resultsCount = 0;
       const rc = content.match(/(\d{1,5})\s+results?/i);
       if (rc) resultsCount = parseInt(rc[1], 10) || 0;
+
+      // When a match_name is supplied, scroll to load more cards then read the
+      // real advertiser on each one, so the caller can filter to this business.
+      let advertisers = [];
+      if (match_name) {
+        for (let i = 0; i < 4; i++) {
+          await page.mouse.wheel(0, 3000);
+          await page.waitForTimeout(800);
+        }
+        try {
+          advertisers = await page.evaluate(extractAdvertisersInPage);
+        } catch (e) {
+          advertisers = [];
+        }
+      }
 
       // Optionally capture screenshots of the first 3 ad cards.
       // Fragile by nature (FB obfuscates class names) — fails gracefully.
@@ -454,16 +529,34 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
         adCount: uniqueIds.length,
         resultsCount,
         htmlLength: content.length,
-        screenshotFilenames
+        screenshotFilenames,
+        advertisers
       };
     });
 
-    // Trust Library IDs over stray "No ads match" text — that message often
-    // appears in sidebar filter states on pages that DO have main-result ads.
-    // Require at least 3 unique Library IDs to filter out single-mention noise.
+    // Default (no match_name): trust Library IDs over stray "No ads match" text —
+    // that message often appears in sidebar filter states on pages that DO have
+    // main-result ads. Require at least 3 unique Library IDs to filter noise.
     const hasSolidLibIds = result.adCount >= 3;
     const hasResultsCount = result.resultsCount > 0;
-    const isRunningAds = hasSolidLibIds || (!result.noAds && hasResultsCount);
+    let isRunningAds = hasSolidLibIds || (!result.noAds && hasResultsCount);
+    let adCount = Math.max(result.adCount, result.resultsCount);
+    let matchedAdvertiser = null;
+    let matchedPageId = null;
+
+    // With match_name: count ONLY the ads whose advertiser is genuinely this
+    // business. Kills the keyword-search false positives.
+    if (match_name) {
+      const mine = (result.advertisers || []).filter((a) =>
+        advertiserMatches(match_name, a.advertiser),
+      );
+      adCount = mine.length;
+      isRunningAds = mine.length > 0;
+      if (mine.length) {
+        matchedAdvertiser = mine[0].advertiser;
+        matchedPageId = mine.find((m) => m.pageId)?.pageId || null;
+      }
+    }
 
     // Build public URLs for any captured screenshots
     const protocol = req.headers['x-forwarded-proto'] || 'https';
@@ -474,10 +567,12 @@ app.post('/api/scrape-meta-ads', async (req, res) => {
 
     res.json({
       isRunningAds,
-      adCount: Math.max(result.adCount, result.resultsCount),
+      adCount,
       adLibraryUrl: url,
       adScreenshots,
-      debug: { htmlLength: result.htmlLength, noAds: result.noAds, libIds: result.adCount, resultsCount: result.resultsCount, screenshotsCaptured: (result.screenshotFilenames || []).length }
+      matchedAdvertiser,
+      matchedPageId,
+      debug: { htmlLength: result.htmlLength, noAds: result.noAds, libIds: result.adCount, resultsCount: result.resultsCount, screenshotsCaptured: (result.screenshotFilenames || []).length, advertisersSeen: (result.advertisers || []).length }
     });
 
   } catch (err) {
